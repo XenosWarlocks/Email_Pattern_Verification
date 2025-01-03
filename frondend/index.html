@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Verifier</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <div class="max-w-md mx-auto bg-white rounded-lg shadow-lg p-6">
+            <h1 class="text-2xl font-bold text-center mb-6">Email Verifier</h1>
+            
+            <form id="uploadForm" class="space-y-4">
+                <div class="space-y-2">
+                    <label class="block text-sm font-medium text-gray-700">
+                        Upload Excel File
+                    </label>
+                    <input type="file" 
+                           accept=".xlsx" 
+                           class="w-full px-3 py-2 border border-gray-300 rounded-md"
+                           id="fileInput"
+                           required>
+                </div>
+                
+                <div class="flex justify-center">
+                    <button type="submit"
+                            class="bg-blue-500 text-white px-4 py-2 rounded-md hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2">
+                        Process File
+                    </button>
+                </div>
+            </form>
+
+            <div id="status" class="mt-4 text-center hidden">
+                <p class="text-gray-700">Processing... Please wait.</p>
+                <div class="mt-2">
+                    <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500 mx-auto"></div>
+                </div>
+            </div>
+
+            <div id="error" class="mt-4 text-center text-red-500 hidden"></div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const fileInput = document.getElementById('fileInput');
+            const status = document.getElementById('status');
+            const error = document.getElementById('error');
+            
+            if (!fileInput.files[0]) {
+                error.textContent = 'Please select a file';
+                error.classList.remove('hidden');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+
+            status.classList.remove('hidden');
+            error.classList.add('hidden');
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || 'An error occurred');
+                }
+
+                // Trigger file download
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'Verified_Lemon_Batch.xlsx';
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                a.remove();
+
+            } catch (err) {
+                error.textContent = err.message;
+                error.classList.remove('hidden');
+            } finally {
+                status.classList.add('hidden');
+                fileInput.value = '';
+            }
+        });
+    </script>
+</body>
+</html>

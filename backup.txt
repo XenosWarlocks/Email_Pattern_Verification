@@ -1,0 +1,726 @@
+# api.py
+from flask import Flask, request, render_template, send_file, jsonify
+import os
+import traceback
+from io import BytesIO
+from werkzeug.utils import secure_filename
+import pandas as pd
+from email_verifier import EmailVerifier
+import tempfile
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# Initialize the EmailVerifier
+verifier = EmailVerifier()
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy'}), 200
+
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    input_filepath = None
+    output_filepath = None
+    
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+            
+        if file and file.filename.endswith('.xlsx'):
+            filename = secure_filename(file.filename)
+            input_filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(input_filepath)
+            
+            # Process the file
+            df = pd.read_excel(input_filepath)
+            
+            def progress_callback(data):
+                progress = data.get('progress', 0)
+                status = data.get('status', '')
+                print(f"Progress: {progress}%, Status: {status}")
+            
+            processed_df = verifier.process_dataframe(df, callback=progress_callback)
+            
+            # Save the processed file
+            output_filepath = os.path.join(app.config['UPLOAD_FOLDER'], 'Verified_Lemon_Batch.xlsx')
+            processed_df.to_excel(output_filepath, index=False)
+            
+            # Read the file into memory before sending
+            with open(output_filepath, 'rb') as f:
+                file_data = f.read()
+            
+            # Clean up files
+            if input_filepath and os.path.exists(input_filepath):
+                os.remove(input_filepath)
+            if output_filepath and os.path.exists(output_filepath):
+                os.remove(output_filepath)
+            
+            return send_file(
+                BytesIO(file_data),
+                as_attachment=True,
+                download_name='Verified_Lemon_Batch.xlsx',
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+            
+        return jsonify({'error': 'Invalid file format'}), 400
+        
+    except Exception as e:
+        # Clean up files in case of error
+        if input_filepath and os.path.exists(input_filepath):
+            os.remove(input_filepath)
+        if output_filepath and os.path.exists(output_filepath):
+            os.remove(output_filepath)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/logs', methods=['GET'])
+def get_logs():
+    try:
+        if os.path.exists(verifier.errors_log_file):
+            with open(verifier.errors_log_file, 'r') as log_file:
+                logs = log_file.read()
+            return jsonify({'logs': logs}), 200
+        return jsonify({'logs': 'No logs found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=False, host='0.0.0.0', port=5000)
+
+#################################################################################
+# email_verifier.py
+import os
+import re
+import time
+import random
+import requests
+import traceback
+import pandas as pd
+import concurrent.futures
+from bs4 import BeautifulSoup
+from nameparser import HumanName
+from urllib.parse import urlparse
+from email_validator import validate_email, EmailNotValidError
+from typing import Optional, Dict, Any, Tuple
+
+class EmailVerifier:
+    def __init__(self):
+        self.errors_log_file = "email_validation_errors.txt"
+        self.create_errors_log_file_if_not_exists()
+        self.visited_urls = set()
+        # self.validate_emails = True
+        self.session = requests.Session()
+        self.MAX_WORKERS = 5  # Limit concurrent requests
+        self.TIMEOUT = 5  # Reduce timeout to 5 seconds
+        
+    def validate_input_file(self, df: pd.DataFrame) -> Tuple[bool, str]:
+        """Validates the input DataFrame structure and content."""
+        required_columns = ['Full Name', 'Company URL', 'Pattern']
+        
+        # Check if DataFrame is empty
+        if df.empty:
+            return False, "Input file is empty"
+            
+        # Check for required columns
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            return False, f"Missing required columns: {', '.join(missing_columns)}"
+            
+        # Check for empty required fields
+        empty_fields = []
+        for col in required_columns:
+            if df[col].isna().any():
+                empty_rows = df[df[col].isna()].index.tolist()
+                empty_fields.append(f"{col} (rows: {empty_rows})")
+        
+        if empty_fields:
+            return False, f"Empty values found in: {', '.join(empty_fields)}"
+            
+        return True, "Validation successful"
+
+    def process_dataframe(self, df: pd.DataFrame, callback: Optional[callable] = None) -> pd.DataFrame:
+        """Process the DataFrame with improved error handling and validation."""
+        try:
+            # Validate input file
+            is_valid, message = self.validate_input_file(df)
+            if not is_valid:
+                raise ValueError(f"Input validation failed: {message}")
+
+            # Create copies of input columns to preserve original data
+            df = df.copy()
+            df['Original Full Name'] = df['Full Name']
+            df['Original Company URL'] = df['Company URL']
+            df['Original Pattern'] = df['Pattern']
+
+            # Initialize result columns with default values
+            df['First Name'] = 'Unknown'
+            df['Last Name'] = 'Unknown'
+            df['Email'] = ''
+            df['Email Verification'] = False
+            df['Phone Number'] = ''
+            df['Processing Status'] = 'Pending'
+            df['Error Message'] = ''
+
+            total_rows = len(df)
+            
+            for index, row in df.iterrows():
+                try:
+                    # Update progress
+                    progress = int((index + 1) * 100 / total_rows)
+                    if callback:
+                        callback({'progress': progress, 'status': f'Processing row {index + 1}/{total_rows}'})
+
+                    # Process name
+                    names = self.safe_parse_name(row['Full Name'])
+                    df.at[index, 'First Name'] = names[0]
+                    df.at[index, 'Last Name'] = names[1]
+
+                    # Generate and verify email
+                    email = self.safe_generate_email(df.iloc[index])
+                    df.at[index, 'Email'] = email
+                    df.at[index, 'Email Verification'] = self.verify_email(email)
+
+                    # Extract phone number
+                    df.at[index, 'Phone Number'] = self.extract_phone_number(row['Company URL']) or ''
+
+                    df.at[index, 'Processing Status'] = 'Completed'
+
+                except Exception as e:
+                    error_msg = f"Error processing row {index}: {str(e)}"
+                    self.log_error("RowProcessingError", error_msg)
+                    df.at[index, 'Processing Status'] = 'Failed'
+                    df.at[index, 'Error Message'] = str(e)
+
+            return df
+
+        except Exception as e:
+            error_msg = f"Error processing dataframe: {str(e)}\n{traceback.format_exc()}"
+            self.log_error("ProcessingError", error_msg)
+            raise
+
+
+    def create_errors_log_file_if_not_exists(self):
+        if not os.path.exists(self.errors_log_file):
+            with open(self.errors_log_file, "w") as log_file:
+                log_file.write("Error Log File\n")
+
+    def safe_parse_name(self, full_name: str) -> Tuple[str, str]:
+        """Safely parse a full name into first and last names."""
+        try:
+            if pd.isna(full_name) or not isinstance(full_name, str):
+                return ('Unknown', 'Unknown')
+
+            parsed_name = HumanName(full_name)
+            first = parsed_name.first or 'Unknown'
+            last = parsed_name.last or 'Unknown'
+            return (first, last)
+        except Exception as e:
+            self.log_error("NameParsingError", f"Error parsing name '{full_name}': {str(e)}")
+            return ('Unknown', 'Unknown')
+
+    def safe_generate_email(self, row: pd.Series) -> str:
+        """Safely generate email address from row data."""
+        try:
+            if pd.isna(row['Company URL']) or pd.isna(row['Pattern']):
+                return ''
+
+            domain = self.extract_domain(row['Company URL'])
+            if not domain:
+                return ''
+
+            pattern = str(row['Pattern'])
+            first_name = str(row['First Name']).lower()
+            last_name = str(row['Last Name']).lower()
+
+            email_local = pattern.replace('{first}', first_name)\
+                               .replace('{last}', last_name)\
+                               .replace('{f}', first_name[0] if first_name else '')\
+                               .replace('{l}', last_name[0] if last_name else '')
+
+            return f"{email_local}@{domain}"
+
+        except Exception as e:
+            self.log_error("EmailGenerationError", f"Error generating email: {str(e)}")
+            return ''
+    
+    def extract_domain(self, url: str) -> str:
+        """Safely extract domain from URL."""
+        try:
+            if not url:
+                return ''
+            
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+                
+            domain = urlparse(url).netloc
+            return domain.replace('www.', '')
+        except Exception as e:
+            self.log_error("DomainExtractionError", f"Error extracting domain from {url}: {str(e)}")
+            return ''
+        
+    def generate_emails(self, first_name, last_name, company_url, pattern):
+        try:
+            if not company_url.startswith('https://') and not company_url.startswith('http://'):
+                company_url = 'https://' + company_url
+            domain = urlparse(company_url).netloc
+            domain = domain.replace('www.', '')
+
+            placeholders = {
+                '{first}': first_name.lower(),
+                '{last}': last_name.lower(),
+                '{f}': first_name[0].lower() if first_name else '',
+                '{l}': last_name[0].lower() if last_name else '',
+                '{first}.{last}': f"{first_name.lower()}.{last_name.lower()}",
+                '{first}_{last}': f"{first_name.lower()}_{last_name.lower()}",
+                '{f}_{last}': f"{first_name[0].lower()}_{last_name.lower()}" if first_name and last_name else ''
+            }
+
+            email = pattern
+            for placeholder, value in placeholders.items():
+                email = email.replace(placeholder, value)
+            return f"{email}@{domain}"
+        except Exception as e:
+            error_msg = f"Error in generate_emails: {str(e)}\n{traceback.format_exc()}"
+            self.log_error("EmailGenerationError", error_msg)
+            raise
+
+    def verify_email(self, email: str) -> bool:
+        try:
+            validate_email(email, check_deliverability=True, timeout=self.TIMEOUT)
+            return True
+        except Exception as e:
+            self.log_error("EmailValidationError", f"Error verifying {email}: {str(e)}")
+            return self.manual_validation(email)
+
+    def manual_validation(self, email):
+        try:
+            return "@" in email
+        except Exception as e:
+            error_msg = f"Error in manual validation: {str(e)}\n{traceback.format_exc()}"
+            self.log_error("ManualValidationError", error_msg)
+            return False
+
+    def log_error(self, error_type, error_message):
+        try:
+            with open(self.errors_log_file, "a") as log_file:
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                log_file.write(f"\n[{timestamp}] {error_type}:\n{error_message}\n")
+        except Exception as e:
+            print(f"Error writing to log file: {str(e)}")
+
+    def extract_phone_number(self, url: str) -> Optional[str]:
+        if not url or url in self.visited_urls:
+            return None
+
+        self.visited_urls.add(url)
+        
+        try:
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+
+            response = self.session.get(url, timeout=self.TIMEOUT, headers=headers)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            pattern = r'\+?(?:[-\s()]?\d[-\s()]?){8,20}'
+            
+            for tag in soup.find_all(["a", "p", "span", "div"], string=True):
+                matches = re.findall(pattern, tag.get_text())
+                if matches:
+                    return matches[0].strip()
+
+            return None
+
+        except Exception as e:
+            self.log_error("PhoneExtractionError", f"Error extracting phone from {url}: {str(e)}")
+            return None
+
+##################################################################################
+
+# email_tes.py
+import re
+import smtplib
+import dns.resolver
+from typing import Tuple, Optional, Dict, List, NamedTuple
+import socket
+import logging
+import ssl
+from datetime import datetime, timedelta
+import json
+from pathlib import Path
+import threading
+from collections import defaultdict
+import requests
+from urllib.parse import urlparse
+
+class RateLimiter:
+    """Rate limiter to prevent server flooding"""
+    def __init__(self, max_requests: int = 5, time_window: int = 60):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = defaultdict(list)
+        self.lock = threading.Lock()
+
+    def can_make_request(self, domain: str) -> bool:
+        with self.lock:
+            now = datetime.now()
+            self.requests[domain] = [req_time for req_time in self.requests[domain] 
+                                   if now - req_time < timedelta(seconds=self.time_window)]
+            if len(self.requests[domain]) < self.max_requests:
+                self.requests[domain].append(now)
+                return True
+            return False
+
+class ValidationScore(NamedTuple):
+    score: float
+    valid: bool
+    confidence: str
+    details: Dict[str, float]
+    message: str
+
+class EnhancedEmailValidator:
+    def __init__(self, from_address: str = 'verify@example.com', cache_file: str = 'email_cache.json'):
+        self.from_address = from_address
+        self.cache_file = Path(cache_file)
+        self.logger = logging.getLogger(__name__)
+        self.rate_limiter = RateLimiter(max_requests=10, time_window=60)
+        
+        # Scoring weights (total = 100)
+        self.weights = {
+            'format': 15,            # Basic email format
+            'domain_pattern': 10,    # Domain structure
+            'mx_records': 25,        # MX record validity
+            'domain_age': 15,        # Age of the domain
+            'company_match': 20,     # Company name matches domain
+            'web_presence': 15       # Website existence and validity
+        }
+        
+        # Business email providers
+        self.business_providers = [
+            'outlook.com', 'office365.com', 'microsoft.com',
+            'google.com', 'googlemail.com', 'zoho.com'
+        ]
+        
+        # Initialize other components
+        self.initialize_components()
+
+    def load_cache(self) -> None:
+        """Load validation cache from file"""
+        try:
+            if self.cache_file.exists():
+                with open(self.cache_file, 'r') as f:
+                    cache_data = json.load(f)
+                    now = datetime.now()
+                    self.cache = {}
+                    for email, data in cache_data.items():
+                        # Convert the timestamp string back to datetime
+                        data['timestamp'] = datetime.fromisoformat(data['timestamp'])
+                        if data['timestamp'] + timedelta(days=1) > now:
+                            self.cache[email] = data
+        except Exception as e:
+            self.logger.error(f"Error loading cache: {e}")
+            self.cache = {}
+
+    def save_cache(self) -> None:
+        """Save validation cache to file"""
+        try:
+            # Convert datetime objects to ISO format strings for JSON serialization
+            cache_data = {
+                email: {
+                    'validation_result': {
+                        'score': data['validation_result'].score,
+                        'valid': data['validation_result'].valid,
+                        'confidence': data['validation_result'].confidence,
+                        'details': data['validation_result'].details,
+                        'message': data['validation_result'].message
+                    },
+                    'timestamp': data['timestamp'].isoformat()
+                }
+                for email, data in self.cache.items()
+            }
+            with open(self.cache_file, 'w') as f:
+                json.dump(cache_data, f)
+        except Exception as e:
+            self.logger.error(f"Error saving cache: {e}")
+
+    def initialize_components(self):
+        """Initialize validator components"""
+        self.ssl_context = ssl.create_default_context()
+        self.cache = {}
+        self.load_cache()
+
+    def calculate_format_score(self, email: str) -> float:
+        """Calculate score for email format validity"""
+        score = 0
+        if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+            score += 10
+            
+            # Additional format checks
+            local_part = email.split('@')[0]
+            if 2 < len(local_part) < 32:  # Reasonable length
+                score += 5
+            if not re.search(r'[._%+-]{2,}', local_part):  # No consecutive special chars
+                score += 5
+            
+        return min(score, 15)  # Cap at 15 points
+
+    def calculate_domain_score(self, domain: str) -> float:
+        """Calculate score for domain validity"""
+        score = 0
+        try:
+            # Basic domain pattern
+            if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$', domain):
+                score += 5
+            
+            # Check domain parts
+            parts = domain.split('.')
+            if 2 <= len(parts) <= 4:
+                score += 3
+            
+            # Length checks
+            if len(domain) < 255 and all(len(p) < 63 for p in parts):
+                score += 2
+                
+        except Exception:
+            return 0
+            
+        return min(score, 10)
+
+    def verify_mx_records_with_score(self, domain: str) -> Tuple[float, List[Tuple[int, str]], str]:
+        """Verify MX records and return a score"""
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 10
+            
+            mx_records = resolver.resolve(domain, 'MX')
+            records = sorted([(r.preference, str(r.exchange)) for r in mx_records])
+            
+            score = 0
+            mx_servers = [mx[1].lower() for mx in records]
+            
+            # Basic MX existence
+            if records:
+                score += 15
+                
+                # Check for business providers
+                if any(provider in mx for mx in mx_servers for provider in self.business_providers):
+                    score += 5
+                
+                # Multiple MX records
+                if len(records) > 1:
+                    score += 5
+                
+                # Properly configured preferences
+                if all(0 <= pref <= 65535 for pref, _ in records):
+                    score += 5
+                
+            return min(score, 25), records, "MX records found and analyzed"
+            
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            return 0, [], "No MX records found"
+        except dns.exception.DNSException as e:
+            return 0, [], f"DNS error: {str(e)}"
+
+    def check_web_presence(self, domain: str) -> float:
+        """Check website existence and validity"""
+        score = 0
+        try:
+            # Try HTTPS first
+            response = requests.head(f'https://{domain}', timeout=5, allow_redirects=True)
+            if response.status_code == 200:
+                score += 10
+                if response.url.startswith('https'):
+                    score += 5
+            elif response.status_code < 500:  # Any valid response
+                score += 5
+        except requests.RequestException:
+            try:
+                # Fallback to HTTP
+                response = requests.head(f'http://{domain}', timeout=5, allow_redirects=True)
+                if response.status_code == 200:
+                    score += 7
+                elif response.status_code < 500:
+                    score += 3
+            except requests.RequestException:
+                pass
+        
+        return min(score, 15)
+
+    def estimate_domain_age(self, domain: str) -> float:
+        """Estimate domain age and popularity"""
+        score = 0
+        try:
+            # WHOIS lookup simulation (you'd want to use a proper WHOIS library)
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 5
+            
+            # Try to resolve various records
+            try:
+                resolver.resolve(domain, 'A')
+                score += 5
+            except Exception:
+                pass
+                
+            try:
+                resolver.resolve(domain, 'MX')
+                score += 5
+            except Exception:
+                pass
+                
+            try:
+                resolver.resolve(f'www.{domain}', 'A')
+                score += 5
+            except Exception:
+                pass
+                
+        except Exception:
+            pass
+            
+        return min(score, 15)
+
+    def analyze_company_match(self, email: str, domain: str) -> float:
+        """Analyze if email matches company pattern"""
+        score = 0
+        
+        # Extract potential company name from domain
+        company_name = domain.split('.')[0].lower()
+        local_part = email.split('@')[0].lower()
+        
+        # Common business email patterns
+        if re.match(r'^[a-z]+\.[a-z]+$', local_part):  # firstname.lastname
+            score += 10
+        elif re.match(r'^[a-z]\.[a-z]+$', local_part):  # f.lastname
+            score += 8
+        elif re.match(r'^[a-z]+$', local_part):  # username
+            score += 5
+            
+        # Check for department or role-based emails
+        common_roles = {'info', 'support', 'sales', 'admin', 'contact', 'hr'}
+        if local_part in common_roles:
+            score += 10
+            
+        return min(score, 20)
+
+    def verify_email_with_score(self, email: str) -> ValidationScore:
+        """Verify email with detailed scoring"""
+        # Check cache first
+        if email in self.cache:
+            cache_entry = self.cache[email]
+            if datetime.now() - cache_entry['timestamp'] < timedelta(days=1):
+                return ValidationScore(
+                    cache_entry['score'],
+                    cache_entry['valid'],
+                    cache_entry['confidence'],
+                    cache_entry['details'],
+                    cache_entry['message']
+                )
+
+        email = email.lower().strip()
+        
+        # Initialize scores dictionary
+        scores = {
+            'format': 0,
+            'domain_pattern': 0,
+            'mx_records': 0,
+            'domain_age': 0,
+            'company_match': 0,
+            'web_presence': 0
+        }
+        
+        try:
+            local_part, domain = email.split('@')
+        except ValueError:
+            return ValidationScore(0, False, "Very Low", scores, "Invalid email format")
+            
+        # Calculate individual scores
+        scores['format'] = self.calculate_format_score(email)
+        scores['domain_pattern'] = self.calculate_domain_score(domain)
+        
+        mx_score, mx_records, mx_message = self.verify_mx_records_with_score(domain)
+        scores['mx_records'] = mx_score
+        
+        scores['domain_age'] = self.estimate_domain_age(domain)
+        scores['company_match'] = self.analyze_company_match(email, domain)
+        scores['web_presence'] = self.check_web_presence(domain)
+        
+        # Calculate total weighted score
+        total_score = sum(scores[k] * self.weights[k] / max(self.weights.values()) 
+                         for k in scores.keys())
+        
+        # Determine confidence level and validity
+        if total_score >= 80:
+            confidence = "Very High"
+            valid = True
+        elif total_score >= 65:
+            confidence = "High"
+            valid = True
+        elif total_score >= 50:
+            confidence = "Medium"
+            valid = True
+        elif total_score >= 35:
+            confidence = "Low"
+            valid = False
+        else:
+            confidence = "Very Low"
+            valid = False
+            
+        # Generate detailed message
+        message = f"Email validation score: {total_score:.1f}/100 ({confidence} confidence)"
+        
+        # Cache the result
+        self.cache[email] = {
+            'score': total_score,
+            'valid': valid,
+            'confidence': confidence,
+            'details': scores,
+            'message': message,
+            'timestamp': datetime.now()
+        }
+        self.save_cache()
+        
+        return ValidationScore(total_score, valid, confidence, scores, message)
+        
+def main():
+    """Main function to run email verification"""
+    logging.basicConfig(level=logging.INFO)
+    validator = EnhancedEmailValidator()
+    
+    print("Enhanced Email Validator (type 'quit' to exit)")
+    print("Note: This tool provides detailed scoring for email validity")
+    
+    while True:
+        email = input('\nEnter email address to verify: ').strip()
+        
+        if email.lower() == 'quit':
+            break
+            
+        print("\nAnalyzing email...")
+        result = validator.verify_email_with_score(email)
+        
+        print(f"\nValidation Results for {email}:")
+        print(f"Overall Score: {result.score:.1f}/100")
+        print(f"Validity: {'Valid' if result.valid else 'Invalid'}")
+        print(f"Confidence: {result.confidence}")
+        print("\nDetailed Scores:")
+        for category, score in result.details.items():
+            print(f"- {category.replace('_', ' ').title()}: {score:.1f}")
+        print(f"\nMessage: {result.message}")
+
+if __name__ == "__main__":
+    main()
+# python email_tes.py
